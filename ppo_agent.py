@@ -12,6 +12,7 @@ from recorder import Recorder
 from utils import explained_variance
 from console_util import fmt_row
 from mpi_util import MpiAdamOptimizer, RunningMeanStd, sync_from_root
+import os
 
 NO_STATES = ['NO_STATES']
 
@@ -67,6 +68,7 @@ class InteractionState(object):
         for venv in self.venvs:
             venv.close()
 
+
 def dict_gather(comm, d, op='mean'):
     if comm is None: return d
     alldicts = comm.allgather(d)
@@ -103,11 +105,14 @@ class PpoAgent(object):
                  vf_coef=1.0,
                  lr=30e-5,
                  adam_hps=None,
-                 testing=False,
+                 testing=False,                                  # 似乎只有关info的update
                  comm=None, comm_train=None, use_news=False,
                  update_ob_stats_every_step=True,
                  int_coeff=None,
                  ext_coeff=None,
+                 test=False, # 不训练只测试
+                 retrain=True, # 不从已有模型获取
+                 ifrender=False,
                  ):
         self.lr = lr
         self.ext_coeff = ext_coeff
@@ -116,6 +121,9 @@ class PpoAgent(object):
         self.update_ob_stats_every_step = update_ob_stats_every_step
         self.abs_scope = (tf.get_variable_scope().name + '/' + scope).lstrip('/')
         self.testing = testing
+        self.retrain = retrain
+        self.test = test
+        self.ifrender = ifrender
         self.comm_log = MPI.COMM_SELF
         if comm is not None and comm.Get_size() > 1:
             self.comm_log = comm
@@ -181,6 +189,7 @@ class PpoAgent(object):
             grads_and_vars = list(zip(grads, vars))
             self._train = trainer.apply_gradients(grads_and_vars)
 
+
         #Quantities for reporting.
         self._losses = [loss, pg_loss, vf_loss, entropy, clipfrac, approxkl, maxkl, self.stochpol.aux_loss,
                         self.stochpol.feat_var, self.stochpol.max_feat, global_grad_norm]
@@ -188,13 +197,43 @@ class PpoAgent(object):
                            "maxfeat", "gradnorm"]
         self.I = None
         self.disable_policy_update = None
+        if self.test:
+            self.disable_policy_update = True
+        self.sess = tf.get_default_session()
+
         allvars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.abs_scope)
+        self.saver = tf.train.Saver(allvars)
+
         if self.is_log_leader:
             tf_util.display_var_info(allvars)
-        tf.get_default_session().run(tf.variables_initializer(allvars))
+
+        self.initialize_networks(allvars)
+        # tf.get_default_session().run(tf.variables_initializer(allvars))
+
         sync_from_root(tf.get_default_session(), allvars) #Syncs initialization across mpi workers.
         self.t0 = time.time()
         self.global_tcount = 0
+
+    def initialize_networks(self, allvars):
+        # Set up directory for saving models
+        self.model_dir = os.getcwd() + '/models'
+        print("self.model_dir:{}".format(self.model_dir))
+        self.model_loc = self.model_dir + '/ppo.ckpt'
+
+        if not os.path.exists(self.model_dir):
+            os.makedirs(self.model_dir)
+
+        if not self.retrain or self.test:     # 利用存的模型数据
+            print("restore sess from {}...".format(self.model_dir))
+            self.saver.restore(self.sess, tf.train.latest_checkpoint(self.model_dir))
+        else:
+            # Initialize actor/critic networks
+            self.sess.run(tf.variables_initializer(allvars))
+
+    # Save neural network parameters
+    def save_model(self, num_steps):
+        self.saver.save(self.sess, self.model_loc, global_step=num_steps)
+        print("save model at step {} finished".format(num_steps))
 
     def start_interaction(self, venvs, disable_policy_update=False):
         self.I = InteractionState(ob_space=self.ob_space, ac_space=self.ac_space,
@@ -337,7 +376,6 @@ class PpoAgent(object):
         self.recorder.record(bufs=to_record,
                              infos=self.I.buf_epinfos)
 
-
         #Create feeddict for optimization.
         envsperbatch = self.I.nenvs // self.nminibatches
         ph_buf = [
@@ -407,14 +445,23 @@ class PpoAgent(object):
         return info
 
     def env_step(self, l, acs):
-        self.I.venvs[l].step_async(acs)
+        # print("action:{}".format(acs))
+        out = self.I.venvs[l].step_async(acs)
         self.I.env_results[l] = None
+
+    def env_render(self,l):
+        # print("render")
+        # import pdb
+        # pdb.set_trace()
+        self.I.venvs[l].render()
+
 
     def env_get(self, l):
         """
         Get most recent (obs, rews, dones, infos) from vectorized environment
         Using step_wait if necessary
         """
+
         if self.I.step_count == 0: # On the zeroth step with a new venv, we need to call reset on the environment
             ob = self.I.venvs[l].reset()
             out = self.I.env_results[l] = (ob, None, np.ones(self.I.lump_stride, bool), {})
@@ -446,27 +493,30 @@ class PpoAgent(object):
             sli = slice(l * self.I.lump_stride, (l + 1) * self.I.lump_stride)
             memsli = slice(None) if self.I.mem_state is NO_STATES else sli
             dict_obs = self.stochpol.ensure_observation_is_dict(obs)
-            with logger.ProfileKV("policy_inference"):
+            # with logger.ProfileKV("policy_inference"):
                 #Calls the policy and value function on current observation.
-                acs, vpreds_int, vpreds_ext, nlps, self.I.mem_state[memsli], ent = self.stochpol.call(dict_obs, news, self.I.mem_state[memsli],
+            acs, vpreds_int, vpreds_ext, nlps, self.I.mem_state[memsli], ent = self.stochpol.call(dict_obs, news, self.I.mem_state[memsli],
                                                                                                                update_obs_stats=self.update_ob_stats_every_step)
             self.env_step(l, acs)
+            if self.ifrender:
+                self.env_render(l)
 
             #Update buffer with transition.
-            for k in self.stochpol.ph_ob_keys:
-                self.I.buf_obs[k][sli, t] = dict_obs[k]
-            self.I.buf_news[sli, t] = news
-            self.I.buf_vpreds_int[sli, t] = vpreds_int
-            self.I.buf_vpreds_ext[sli, t] = vpreds_ext
-            self.I.buf_nlps[sli, t] = nlps
-            self.I.buf_acs[sli, t] = acs
-            self.I.buf_ent[sli, t] = ent
+            if not self.test:
+                for k in self.stochpol.ph_ob_keys:
+                    self.I.buf_obs[k][sli, t] = dict_obs[k]
+                self.I.buf_news[sli, t] = news
+                self.I.buf_vpreds_int[sli, t] = vpreds_int
+                self.I.buf_vpreds_ext[sli, t] = vpreds_ext
+                self.I.buf_nlps[sli, t] = nlps
+                self.I.buf_acs[sli, t] = acs
+                self.I.buf_ent[sli, t] = ent
 
-            if t > 0:
-                self.I.buf_rews_ext[sli, t-1] = prevrews
+                if t > 0:
+                    self.I.buf_rews_ext[sli, t - 1] = prevrews
 
         self.I.step_count += 1
-        if t == self.nsteps - 1 and not self.disable_policy_update:
+        if t == self.nsteps - 1 and not self.disable_policy_update and not self.test:
             #We need to take one extra step so every transition has a reward.
             for l in range(self.I.nlump):
                 sli = slice(l * self.I.lump_stride, (l + 1) * self.I.lump_stride)
@@ -535,7 +585,6 @@ class PpoAgent(object):
                 self.I.stats['tcount'] += epinfo['l']
                 self.I.stats['rewtotal'] += epinfo['r']
                 # self.I.stats["best_ext_ret"] = self.best_ret
-
 
         return {'update' : update_info}
 
