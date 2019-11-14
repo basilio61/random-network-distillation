@@ -10,7 +10,6 @@ from cmd_util import make_atari_env, arg_parser
 from policies.cnn_gru_policy_dynamics import CnnGruPolicy
 from policies.cnn_policy_param_matched import CnnPolicy
 from ppo_agent import PpoAgent
-from ppo_agent_light import PpoAgentLight
 from utils import set_global_seeds
 from vec_env import VecFrameStack
 from atari_wrappers import make_atari
