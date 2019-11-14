@@ -13,7 +13,7 @@ from atari_wrappers import make_atari, wrap_deepmind
 from vec_env import SubprocVecEnv
 
 
-def make_atari_env(env_id, num_env, seed, wrapper_kwargs=None, start_index=0, max_episode_steps=4500):
+def make_atari_env(env_id, num_env, seed, wrapper_kwargs=None, start_index=0, max_episode_steps=4500, ifrender=False):
     """
     Create a wrapped, monitored SubprocVecEnv for Atari.
     """
